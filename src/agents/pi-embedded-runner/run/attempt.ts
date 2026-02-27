@@ -39,7 +39,8 @@ import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import { resolveOpenClawDocsPath } from "../../docs-path.js";
 import { isTimeoutError } from "../../failover-error.js";
 import { resolveImageSanitizationLimits } from "../../image-sanitization.js";
-import { resolveModelAuthMode } from "../../model-auth.js";
+import { runMastraAgent } from "../../mastra/index.js";
+import { getCustomProviderApiKey, resolveModelAuthMode } from "../../model-auth.js";
 import { resolveDefaultModelForAgent } from "../../model-selection.js";
 import { createOllamaStreamFn, OLLAMA_NATIVE_BASE_URL } from "../../ollama-stream.js";
 import { resolveOwnerDisplaySetting } from "../../owner-display.js";
@@ -605,6 +606,91 @@ export async function runEmbeddedAttempt(
     });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
     let systemPromptText = systemPromptOverride();
+
+    // --- Mastra gateway path ---
+    // When agents.defaults.gateway = "mastra", bypass the pi-coding-agent session
+    // machinery and use the Mastra AI framework instead.
+    const useMastraGateway = params.config?.agents?.defaults?.gateway === "mastra";
+    if (useMastraGateway) {
+      // Resolve API key: try authStorage first (set by run.ts), then config, then env
+      const mastraApiKey: string | undefined = (() => {
+        try {
+          // authStorage.getApiKey is set by run.ts before calling runEmbeddedAttempt
+          const fromStorage = (
+            params.authStorage as { getApiKey?: (p: string) => string | undefined }
+          ).getApiKey?.(params.provider);
+          if (fromStorage) {
+            return fromStorage;
+          }
+        } catch {
+          // ignore
+        }
+        return getCustomProviderApiKey(params.config, params.provider);
+      })();
+
+      const mastraResult = await runMastraAgent({
+        provider: params.provider,
+        modelId: params.modelId,
+        modelApi: params.model.api ?? "openai-completions",
+        baseUrl:
+          typeof (params.model as { baseUrl?: unknown }).baseUrl === "string"
+            ? (params.model as { baseUrl: string }).baseUrl
+            : undefined,
+        apiKey: mastraApiKey,
+        headers: params.model.headers,
+        systemPrompt: systemPromptText,
+        historyMessages: [],
+        prompt: params.prompt,
+        images: params.images?.map((img) => ({
+          data: typeof img === "string" ? img : ((img as { data?: string }).data ?? ""),
+          mimeType:
+            typeof img === "string"
+              ? "image/jpeg"
+              : ((img as { mimeType?: string }).mimeType ?? "image/jpeg"),
+        })),
+        tools: toolsRaw,
+        thinkLevel: params.thinkLevel,
+        maxSteps: 50,
+        abortSignal: params.abortSignal ?? runAbortController.signal,
+        onTextDelta: params.onPartialReply
+          ? (text) => params.onPartialReply?.({ text, runId: params.runId })
+          : undefined,
+        sessionFile: params.sessionFile,
+      });
+
+      return {
+        aborted: mastraResult.aborted,
+        timedOut: mastraResult.timedOut,
+        timedOutDuringCompaction: false,
+        promptError: mastraResult.error ?? null,
+        sessionIdUsed: params.sessionId,
+        systemPromptReport,
+        messagesSnapshot: [],
+        assistantTexts: mastraResult.text ? [mastraResult.text] : [],
+        toolMetas: mastraResult.toolCalls.map((tc) => ({ toolName: tc.toolName })),
+        lastAssistant: mastraResult.text
+          ? ({ role: "assistant", content: mastraResult.text } as AgentMessage)
+          : undefined,
+        lastToolError: undefined,
+        didSendViaMessagingTool: false,
+        messagingToolSentTexts: [],
+        messagingToolSentMediaUrls: [],
+        messagingToolSentTargets: [],
+        successfulCronAdds: 0,
+        cloudCodeAssistFormatError: false,
+        attemptUsage: mastraResult.usage
+          ? {
+              inputTokens: mastraResult.usage.promptTokens,
+              outputTokens: mastraResult.usage.completionTokens,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            }
+          : undefined,
+        compactionCount: 0,
+        clientToolCall: undefined,
+      };
+    }
+    // --- End Mastra gateway path ---
 
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,

@@ -100,6 +100,12 @@ export const AgentDefaultsSchema = z
       })
       .strict()
       .optional(),
+    gateway: z
+      .union([z.literal("pi"), z.literal("mastra")])
+      .optional()
+      .describe(
+        "LLM gateway engine: 'pi' (default, @mariozechner/pi-coding-agent) or 'mastra' (Mastra AI framework).",
+      ),
     embeddedPi: z
       .object({
         projectSettingsPolicy: z
