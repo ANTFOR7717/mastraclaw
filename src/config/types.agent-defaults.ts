@@ -158,6 +158,12 @@ export type AgentDefaultsConfig = {
   contextPruning?: AgentContextPruningConfig;
   /** Compaction tuning and pre-compaction memory flush behavior. */
   compaction?: AgentCompactionConfig;
+  /**
+   * LLM gateway engine selection.
+   * - "pi" (default): use the @mariozechner/pi-coding-agent stack
+   * - "mastra": use the Mastra AI framework (Vercel AI SDK based)
+   */
+  gateway?: "pi" | "mastra";
   /** Embedded Pi runner hardening and compatibility controls. */
   embeddedPi?: {
     /**
