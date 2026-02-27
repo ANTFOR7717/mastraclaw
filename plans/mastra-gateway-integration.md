@@ -675,13 +675,52 @@ graph TD
 
 ---
 
-## 15. Open Questions
+## 15. Resolved Implementation Details
 
-1. **Anthropic OAuth tokens:** Does `OpenAICompatibleConfig` support `Authorization: Bearer sk-ant-oat-*` headers, or does Anthropic's OAuth flow require the native `@ai-sdk/anthropic` package? If the latter, add `@ai-sdk/anthropic` to the dependency list and use it when `apiKey` starts with `sk-ant-oat-`.
+These were potential open questions; all three are resolved by inspecting the Mastra v1.8.0 package source directly.
 
-2. **Tool result streaming:** pi-agent-core supports streaming tool results (partial results during execution). Does Mastra's `fullStream` expose partial tool results, or only final results? If only final, the streaming UX for long-running tools may differ.
+### 15.1 Anthropic OAuth tokens (`sk-ant-oat-*`) — **Not a dependency, already works**
 
-3. **`maxSteps` for tool loops:** The current pi-coding-agent loop runs until the model stops calling tools. Mastra's `agent.stream()` has a `maxSteps` option. What should the default be? (Suggested: 50, matching typical pi-coding-agent behavior.)
+Verified from `createOpenAICompatible` in Mastra's bundled source:
+
+```javascript
+const headers = {
+  ...options.apiKey && { Authorization: `Bearer ${options.apiKey}` },
+  ...options.headers
+};
+```
+
+`OpenAICompatibleConfig` sets `Authorization: Bearer <apiKey>`. Passing `sk-ant-oat-*` as `apiKey` sends the correct Bearer header that Anthropic's OAuth API expects. **No `@ai-sdk/anthropic` package is needed for OAuth tokens.** This is a non-issue — `OpenAICompatibleConfig` handles it natively.
+
+### 15.2 Partial tool result streaming — **Supported natively**
+
+Verified from `stream/types.d.ts`: Mastra's `fullStream` emits these tool-related chunk types:
+
+```
+tool-call-input-streaming-start  — tool call begins, args streaming starts
+tool-call-delta                  — partial tool call args delta
+tool-call-input-streaming-end    — tool call args complete
+tool-call                        — final tool call (name + complete args)
+tool-result                      — final tool result (after execution)
+```
+
+Tool call input streaming is supported. Tool results are emitted as final (not partial) — same behavior as pi-agent-core. This is a feature that works out of the box, not a dependency to add.
+
+### 15.3 `maxSteps` default — **A required configuration, not a dependency**
+
+Verified from Mastra source: `maxSteps` defaults to `5`. The current pi-coding-agent loop runs until the model stops calling tools (no hard limit). **The adapter must set `maxSteps` explicitly** to avoid cutting off tool loops prematurely.
+
+This is a **configuration value** to set in the adapter, not a new dependency:
+
+```typescript
+// In agent-runner.ts
+const output = await agent.stream(coreMessages, {
+  maxSteps: params.config?.agents?.defaults?.maxSteps ?? 50,
+  providerOptions: toMastraProviderOptions(params.thinkLevel, params.provider),
+});
+```
+
+Recommended default: `50` (matches typical pi-coding-agent behavior for complex tasks). Configurable via `agents.defaults.maxSteps` in the OpenClaw config (field already exists).
 
 ---
 
