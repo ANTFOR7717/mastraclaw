@@ -266,7 +266,12 @@ function applyMessageMutationInPlace(target: AgentMessage, source: AgentMessage)
   Object.assign(targetRecord, sourceRecord);
 }
 
-function enforceToolResultContextBudgetInPlace(params: {
+/**
+ * Exported for use by the Mastra adapter layer (agent-runner.ts).
+ * Called before agent.stream() to prevent context overflow from large tool results.
+ * This is a pure function with no pi-agent-core runtime dependency.
+ */
+export function enforceToolResultContextBudgetInPlace(params: {
   messages: AgentMessage[];
   contextBudgetChars: number;
   maxSingleToolResultChars: number;

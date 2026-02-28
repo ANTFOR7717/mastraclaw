@@ -118,6 +118,11 @@ export type CliBackendConfig = {
 };
 
 export type AgentDefaultsConfig = {
+  /**
+   * LLM execution gateway: "pi" uses the @mariozechner/pi-* stack (default),
+   * "mastra" uses the Mastra v1.8.0 adapter layer.
+   */
+  gateway?: "pi" | "mastra";
   /** Primary model and fallbacks (provider/model). Accepts string or {primary,fallbacks}. */
   model?: AgentModelConfig;
   /** Optional image-capable model and fallbacks (provider/model). Accepts string or {primary,fallbacks}. */

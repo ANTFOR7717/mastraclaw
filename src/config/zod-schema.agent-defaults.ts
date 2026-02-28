@@ -15,6 +15,12 @@ import {
 
 export const AgentDefaultsSchema = z
   .object({
+    gateway: z
+      .union([z.literal("pi"), z.literal("mastra")])
+      .optional()
+      .describe(
+        'LLM execution gateway: "pi" uses the @mariozechner/pi-* stack (default), "mastra" uses the Mastra adapter layer.',
+      ),
     model: AgentModelSchema.optional(),
     imageModel: AgentModelSchema.optional(),
     models: z

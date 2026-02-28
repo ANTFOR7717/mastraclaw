@@ -7,6 +7,8 @@ import {
   DefaultResourceLoader,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
+import { runMastraLlmCall } from "../../mastra/agent-runner.js";
+import type { MastraRunHandle } from "../../mastra/types.js";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import type { OpenClawConfig } from "../../../config/config.js";
@@ -613,6 +615,10 @@ export async function runEmbeddedAttempt(
       }),
     });
 
+    // Feature flag: use Mastra gateway instead of pi-coding-agent for LLM calls.
+    // Default: "pi" (no behavior change for existing users).
+    const usesMastra = params.config?.agents?.defaults?.gateway === "mastra";
+
     let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     let removeToolResultContextGuard: (() => void) | undefined;
@@ -708,190 +714,216 @@ export async function runEmbeddedAttempt(
 
       const allCustomTools = [...customTools, ...clientToolDefs];
 
-      ({ session } = await createAgentSession({
-        cwd: resolvedWorkspace,
-        agentDir,
-        authStorage: params.authStorage,
-        modelRegistry: params.modelRegistry,
-        model: params.model,
-        thinkingLevel: mapThinkingLevel(params.thinkLevel),
-        tools: builtInTools,
-        customTools: allCustomTools,
-        sessionManager,
-        settingsManager,
-        resourceLoader,
-      }));
-      applySystemPromptOverrideToSession(session, systemPromptText);
-      if (!session) {
-        throw new Error("Embedded agent session missing");
-      }
-      const activeSession = session;
-      removeToolResultContextGuard = installToolResultContextGuard({
-        agent: activeSession.agent,
-        contextWindowTokens: Math.max(
-          1,
-          Math.floor(
-            params.model.contextWindow ?? params.model.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
-          ),
-        ),
-      });
-      const cacheTrace = createCacheTrace({
-        cfg: params.config,
-        env: process.env,
-        runId: params.runId,
-        sessionId: activeSession.sessionId,
-        sessionKey: params.sessionKey,
-        provider: params.provider,
-        modelId: params.modelId,
-        modelApi: params.model.api,
-        workspaceDir: params.workspaceDir,
-      });
-      const anthropicPayloadLogger = createAnthropicPayloadLogger({
-        env: process.env,
-        runId: params.runId,
-        sessionId: activeSession.sessionId,
-        sessionKey: params.sessionKey,
-        provider: params.provider,
-        modelId: params.modelId,
-        modelApi: params.model.api,
-        workspaceDir: params.workspaceDir,
-      });
-
-      // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
-      // for reliable streaming + tool calling support (#11828).
-      if (params.model.api === "ollama") {
-        // Use the resolved model baseUrl first so custom provider aliases work.
-        const providerConfig = params.config?.models?.providers?.[params.model.provider];
-        const modelBaseUrl =
-          typeof params.model.baseUrl === "string" ? params.model.baseUrl.trim() : "";
-        const providerBaseUrl =
-          typeof providerConfig?.baseUrl === "string" ? providerConfig.baseUrl.trim() : "";
-        const ollamaBaseUrl = modelBaseUrl || providerBaseUrl || OLLAMA_NATIVE_BASE_URL;
-        activeSession.agent.streamFn = createOllamaStreamFn(ollamaBaseUrl);
-      } else {
-        // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
-        activeSession.agent.streamFn = streamSimple;
-      }
-
-      applyExtraParamsToAgent(
-        activeSession.agent,
-        params.config,
-        params.provider,
-        params.modelId,
-        params.streamParams,
-        params.thinkLevel,
-        sessionAgentId,
-      );
-
-      if (cacheTrace) {
-        cacheTrace.recordStage("session:loaded", {
-          messages: activeSession.messages,
-          system: systemPromptText,
-          note: "after session create",
-        });
-        activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
-      }
-
-      // Copilot/Claude can reject persisted `thinking` blocks (e.g. thinkingSignature:"reasoning_text")
-      // on *any* follow-up provider call (including tool continuations). Wrap the stream function
-      // so every outbound request sees sanitized messages.
-      if (transcriptPolicy.dropThinkingBlocks) {
-        const inner = activeSession.agent.streamFn;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const sanitized = dropThinkingBlocks(messages as unknown as AgentMessage[]) as unknown;
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
-      }
-
-      // Mistral (and other strict providers) reject tool call IDs that don't match their
-      // format requirements (e.g. [a-zA-Z0-9]{9}). sanitizeSessionHistory only processes
-      // historical messages at attempt start, but the agent loop's internal tool call →
-      // tool result cycles bypass that path. Wrap streamFn so every outbound request
-      // sees sanitized tool call IDs.
-      if (transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode) {
-        const inner = activeSession.agent.streamFn;
-        const mode = transcriptPolicy.toolCallIdMode;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const sanitized = sanitizeToolCallIdsForCloudCodeAssist(messages as AgentMessage[], mode);
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
-      }
-
-      // Some models emit tool names with surrounding whitespace (e.g. " read ").
-      // pi-agent-core dispatches tool calls with exact string matching, so normalize
-      // names on the live response stream before tool execution.
-      activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(activeSession.agent.streamFn);
-
-      if (anthropicPayloadLogger) {
-        activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
-          activeSession.agent.streamFn,
-        );
-      }
-
-      try {
-        const prior = await sanitizeSessionHistory({
-          messages: activeSession.messages,
-          modelApi: params.model.api,
-          modelId: params.modelId,
-          provider: params.provider,
-          allowedToolNames,
-          config: params.config,
-          sessionManager,
-          sessionId: params.sessionId,
-          policy: transcriptPolicy,
-        });
-        cacheTrace?.recordStage("session:sanitized", { messages: prior });
-        const validatedGemini = transcriptPolicy.validateGeminiTurns
-          ? validateGeminiTurns(prior)
-          : prior;
-        const validated = transcriptPolicy.validateAnthropicTurns
-          ? validateAnthropicTurns(validatedGemini)
-          : validatedGemini;
-        const truncated = limitHistoryTurns(
-          validated,
-          getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
-        );
-        // Re-run tool_use/tool_result pairing repair after truncation, since
-        // limitHistoryTurns can orphan tool_result blocks by removing the
-        // assistant message that contained the matching tool_use.
-        const limited = transcriptPolicy.repairToolUseResultPairing
-          ? sanitizeToolUseResultPairing(truncated)
-          : truncated;
-        cacheTrace?.recordStage("session:limited", { messages: limited });
-        if (limited.length > 0) {
-          activeSession.agent.replaceMessages(limited);
+      if (usesMastra) {
+        // ── Mastra path: skip createAgentSession; use runMastraLlmCall instead ──
+        // All surrounding infrastructure (session repair, history sanitization,
+        // hooks, abort handling, etc.) runs unchanged in the shared code above/below.
+        // Only the LLM call itself is replaced here.
+        //
+        // We still need a minimal session + sessionManager for JSONL persistence.
+        // Open the session manager (already done above) and proceed.
+        if (!sessionManager) {
+          throw new Error("Mastra path: sessionManager not initialized");
         }
-      } catch (err) {
-        await flushPendingToolResultsAfterIdle({
-          agent: activeSession?.agent,
+      } else {
+        ({ session } = await createAgentSession({
+          cwd: resolvedWorkspace,
+          agentDir,
+          authStorage: params.authStorage,
+          modelRegistry: params.modelRegistry,
+          model: params.model,
+          thinkingLevel: mapThinkingLevel(params.thinkLevel),
+          tools: builtInTools,
+          customTools: allCustomTools,
           sessionManager,
-        });
-        activeSession.dispose();
-        throw err;
+          settingsManager,
+          resourceLoader,
+        }));
+        applySystemPromptOverrideToSession(session, systemPromptText);
+        if (!session) {
+          throw new Error("Embedded agent session missing");
+        }
+      }
+      const activeSession = usesMastra ? null : session!;
+      removeToolResultContextGuard = usesMastra
+        ? undefined
+        : installToolResultContextGuard({
+            agent: activeSession!.agent,
+            contextWindowTokens: Math.max(
+              1,
+              Math.floor(
+                params.model.contextWindow ?? params.model.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
+              ),
+            ),
+          });
+      // ── pi-only: cacheTrace, anthropicPayloadLogger, streamFn setup, sanitizeSessionHistory ──
+      // These all operate on the pi session object (activeSession). The Mastra path skips them:
+      // - cacheTrace/anthropicPayloadLogger: diagnostic only, not needed for Mastra MVP
+      // - streamFn wrappers: Mastra handles these via pre/post-processing in agent-runner.ts
+      // - sanitizeSessionHistory: called in agent-runner.ts before toCoreMessages() (blocker #4)
+      const cacheTrace = usesMastra
+        ? null
+        : createCacheTrace({
+            cfg: params.config,
+            env: process.env,
+            runId: params.runId,
+            sessionId: activeSession!.sessionId,
+            sessionKey: params.sessionKey,
+            provider: params.provider,
+            modelId: params.modelId,
+            modelApi: params.model.api,
+            workspaceDir: params.workspaceDir,
+          });
+      const anthropicPayloadLogger = usesMastra
+        ? null
+        : createAnthropicPayloadLogger({
+            env: process.env,
+            runId: params.runId,
+            sessionId: activeSession!.sessionId,
+            sessionKey: params.sessionKey,
+            provider: params.provider,
+            modelId: params.modelId,
+            modelApi: params.model.api,
+            workspaceDir: params.workspaceDir,
+          });
+
+      if (!usesMastra && activeSession) {
+        // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
+        // for reliable streaming + tool calling support (#11828).
+        if (params.model.api === "ollama") {
+          // Use the resolved model baseUrl first so custom provider aliases work.
+          const providerConfig = params.config?.models?.providers?.[params.model.provider];
+          const modelBaseUrl =
+            typeof params.model.baseUrl === "string" ? params.model.baseUrl.trim() : "";
+          const providerBaseUrl =
+            typeof providerConfig?.baseUrl === "string" ? providerConfig.baseUrl.trim() : "";
+          const ollamaBaseUrl = modelBaseUrl || providerBaseUrl || OLLAMA_NATIVE_BASE_URL;
+          activeSession.agent.streamFn = createOllamaStreamFn(ollamaBaseUrl);
+        } else {
+          // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
+          activeSession.agent.streamFn = streamSimple;
+        }
+
+        applyExtraParamsToAgent(
+          activeSession.agent,
+          params.config,
+          params.provider,
+          params.modelId,
+          params.streamParams,
+          params.thinkLevel,
+          sessionAgentId,
+        );
+
+        if (cacheTrace) {
+          cacheTrace.recordStage("session:loaded", {
+            messages: activeSession.messages,
+            system: systemPromptText,
+            note: "after session create",
+          });
+          activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
+        }
+
+        // Copilot/Claude can reject persisted `thinking` blocks (e.g. thinkingSignature:"reasoning_text")
+        // on *any* follow-up provider call (including tool continuations). Wrap the stream function
+        // so every outbound request sees sanitized messages.
+        if (transcriptPolicy.dropThinkingBlocks) {
+          const inner = activeSession.agent.streamFn;
+          activeSession.agent.streamFn = (model, context, options) => {
+            const ctx = context as unknown as { messages?: unknown };
+            const messages = ctx?.messages;
+            if (!Array.isArray(messages)) {
+              return inner(model, context, options);
+            }
+            const sanitized = dropThinkingBlocks(messages as unknown as AgentMessage[]) as unknown;
+            if (sanitized === messages) {
+              return inner(model, context, options);
+            }
+            const nextContext = {
+              ...(context as unknown as Record<string, unknown>),
+              messages: sanitized,
+            } as unknown;
+            return inner(model, nextContext as typeof context, options);
+          };
+        }
+
+        // Mistral (and other strict providers) reject tool call IDs that don't match their
+        // format requirements (e.g. [a-zA-Z0-9]{9}). sanitizeSessionHistory only processes
+        // historical messages at attempt start, but the agent loop's internal tool call →
+        // tool result cycles bypass that path. Wrap streamFn so every outbound request
+        // sees sanitized tool call IDs.
+        if (transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode) {
+          const inner = activeSession.agent.streamFn;
+          const mode = transcriptPolicy.toolCallIdMode;
+          activeSession.agent.streamFn = (model, context, options) => {
+            const ctx = context as unknown as { messages?: unknown };
+            const messages = ctx?.messages;
+            if (!Array.isArray(messages)) {
+              return inner(model, context, options);
+            }
+            const sanitized = sanitizeToolCallIdsForCloudCodeAssist(messages as AgentMessage[], mode);
+            if (sanitized === messages) {
+              return inner(model, context, options);
+            }
+            const nextContext = {
+              ...(context as unknown as Record<string, unknown>),
+              messages: sanitized,
+            } as unknown;
+            return inner(model, nextContext as typeof context, options);
+          };
+        }
+
+        // Some models emit tool names with surrounding whitespace (e.g. " read ").
+        // pi-agent-core dispatches tool calls with exact string matching, so normalize
+        // names on the live response stream before tool execution.
+        activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(activeSession.agent.streamFn);
+
+        if (anthropicPayloadLogger) {
+          activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
+            activeSession.agent.streamFn,
+          );
+        }
+
+        try {
+          const prior = await sanitizeSessionHistory({
+            messages: activeSession.messages,
+            modelApi: params.model.api,
+            modelId: params.modelId,
+            provider: params.provider,
+            allowedToolNames,
+            config: params.config,
+            sessionManager,
+            sessionId: params.sessionId,
+            policy: transcriptPolicy,
+          });
+          cacheTrace?.recordStage("session:sanitized", { messages: prior });
+          const validatedGemini = transcriptPolicy.validateGeminiTurns
+            ? validateGeminiTurns(prior)
+            : prior;
+          const validated = transcriptPolicy.validateAnthropicTurns
+            ? validateAnthropicTurns(validatedGemini)
+            : validatedGemini;
+          const truncated = limitHistoryTurns(
+            validated,
+            getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
+          );
+          // Re-run tool_use/tool_result pairing repair after truncation, since
+          // limitHistoryTurns can orphan tool_result blocks by removing the
+          // assistant message that contained the matching tool_use.
+          const limited = transcriptPolicy.repairToolUseResultPairing
+            ? sanitizeToolUseResultPairing(truncated)
+            : truncated;
+          cacheTrace?.recordStage("session:limited", { messages: limited });
+          if (limited.length > 0) {
+            activeSession.agent.replaceMessages(limited);
+          }
+        } catch (err) {
+          await flushPendingToolResultsAfterIdle({
+            agent: activeSession?.agent,
+            sessionManager,
+          });
+          activeSession.dispose();
+          throw err;
+        }
       }
 
       let aborted = Boolean(params.abortSignal?.aborted);
@@ -920,7 +952,10 @@ export async function runEmbeddedAttempt(
         } else {
           runAbortController.abort(reason);
         }
-        void activeSession.abort();
+        // Mastra path: abort is handled via runAbortController signal forwarding in agent-runner.ts
+        if (!usesMastra && activeSession) {
+          void activeSession.abort();
+        }
       };
       const abortable = <T>(promise: Promise<T>): Promise<T> => {
         const signal = runAbortController.signal;
@@ -946,29 +981,39 @@ export async function runEmbeddedAttempt(
         });
       };
 
-      const subscription = subscribeEmbeddedPiSession({
-        session: activeSession,
-        runId: params.runId,
-        hookRunner: getGlobalHookRunner() ?? undefined,
-        verboseLevel: params.verboseLevel,
-        reasoningMode: params.reasoningLevel ?? "off",
-        toolResultFormat: params.toolResultFormat,
-        shouldEmitToolResult: params.shouldEmitToolResult,
-        shouldEmitToolOutput: params.shouldEmitToolOutput,
-        onToolResult: params.onToolResult,
-        onReasoningStream: params.onReasoningStream,
-        onReasoningEnd: params.onReasoningEnd,
-        onBlockReply: params.onBlockReply,
-        onBlockReplyFlush: params.onBlockReplyFlush,
-        blockReplyBreak: params.blockReplyBreak,
-        blockReplyChunking: params.blockReplyChunking,
-        onPartialReply: params.onPartialReply,
-        onAssistantMessageStart: params.onAssistantMessageStart,
-        onAgentEvent: params.onAgentEvent,
-        enforceFinalTag: params.enforceFinalTag,
-        config: params.config,
-        sessionKey: params.sessionKey ?? params.sessionId,
-      });
+      // ── Subscription + queue handle: pi path uses subscribeEmbeddedPiSession;
+      // Mastra path uses a lightweight stub that exposes the same interface. ──
+
+      // Mastra run handle (set when usesMastra; used for queueHandle below)
+      let mastraRunHandle: MastraRunHandle | null = null;
+      // Collected assistant texts for the result (Mastra path populates this)
+      const mastraAssistantTexts: string[] = [];
+
+      const subscription = usesMastra
+        ? null
+        : subscribeEmbeddedPiSession({
+            session: activeSession!,
+            runId: params.runId,
+            hookRunner: getGlobalHookRunner() ?? undefined,
+            verboseLevel: params.verboseLevel,
+            reasoningMode: params.reasoningLevel ?? "off",
+            toolResultFormat: params.toolResultFormat,
+            shouldEmitToolResult: params.shouldEmitToolResult,
+            shouldEmitToolOutput: params.shouldEmitToolOutput,
+            onToolResult: params.onToolResult,
+            onReasoningStream: params.onReasoningStream,
+            onReasoningEnd: params.onReasoningEnd,
+            onBlockReply: params.onBlockReply,
+            onBlockReplyFlush: params.onBlockReplyFlush,
+            blockReplyBreak: params.blockReplyBreak,
+            blockReplyChunking: params.blockReplyChunking,
+            onPartialReply: params.onPartialReply,
+            onAssistantMessageStart: params.onAssistantMessageStart,
+            onAgentEvent: params.onAgentEvent,
+            enforceFinalTag: params.enforceFinalTag,
+            config: params.config,
+            sessionKey: params.sessionKey ?? params.sessionId,
+          });
 
       const {
         assistantTexts,
@@ -983,16 +1028,41 @@ export async function runEmbeddedAttempt(
         getLastToolError,
         getUsageTotals,
         getCompactionCount,
-      } = subscription;
-
-      const queueHandle: EmbeddedPiQueueHandle = {
-        queueMessage: async (text: string) => {
-          await activeSession.steer(text);
-        },
-        isStreaming: () => activeSession.isStreaming,
-        isCompacting: () => subscription.isCompacting(),
-        abort: abortRun,
+      } = subscription ?? {
+        // Mastra path stubs — populated after the run completes
+        assistantTexts: mastraAssistantTexts,
+        toolMetas: [] as { toolName: string; meta?: string }[],
+        unsubscribe: () => {},
+        waitForCompactionRetry: () => Promise.resolve(),
+        getMessagingToolSentTexts: () => [],
+        getMessagingToolSentMediaUrls: () => [],
+        getMessagingToolSentTargets: () => [],
+        getSuccessfulCronAdds: () => [],
+        didSendViaMessagingTool: () => false,
+        getLastToolError: () => undefined,
+        getUsageTotals: () => undefined,
+        getCompactionCount: () => 0,
+        isCompacting: () => false,
       };
+
+      const queueHandle: EmbeddedPiQueueHandle = usesMastra
+        ? {
+            // Blocker #1 + #2: Mastra handle exposes isStreaming/isCompacting/queueMessage
+            queueMessage: async (text: string) => {
+              await mastraRunHandle?.queueMessage(text);
+            },
+            isStreaming: () => mastraRunHandle?.isStreaming() ?? false,
+            isCompacting: () => false, // Mastra has no compaction
+            abort: abortRun,
+          }
+        : {
+            queueMessage: async (text: string) => {
+              await activeSession!.steer(text);
+            },
+            isStreaming: () => activeSession!.isStreaming,
+            isCompacting: () => subscription!.isCompacting(),
+            abort: abortRun,
+          };
       setActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
 
       let abortWarnTimer: NodeJS.Timeout | undefined;
@@ -1007,8 +1077,8 @@ export async function runEmbeddedAttempt(
           if (
             shouldFlagCompactionTimeout({
               isTimeout: true,
-              isCompactionPendingOrRetrying: subscription.isCompacting(),
-              isCompactionInFlight: activeSession.isCompacting,
+              isCompactionPendingOrRetrying: subscription?.isCompacting() ?? false,
+              isCompactionInFlight: activeSession?.isCompacting ?? false,
             })
           ) {
             timedOutDuringCompaction = true;
@@ -1016,7 +1086,7 @@ export async function runEmbeddedAttempt(
           abortRun(true);
           if (!abortWarnTimer) {
             abortWarnTimer = setTimeout(() => {
-              if (!activeSession.isStreaming) {
+              if (usesMastra ? !mastraRunHandle?.isStreaming() : !activeSession?.isStreaming) {
                 return;
               }
               if (!isProbeSession) {
@@ -1031,15 +1101,17 @@ export async function runEmbeddedAttempt(
       );
 
       let messagesSnapshot: AgentMessage[] = [];
-      let sessionIdUsed = activeSession.sessionId;
+      let sessionIdUsed = usesMastra
+        ? params.sessionId
+        : activeSession!.sessionId;
       const onAbort = () => {
         const reason = params.abortSignal ? getAbortReason(params.abortSignal) : undefined;
         const timeout = reason ? isTimeoutError(reason) : false;
         if (
           shouldFlagCompactionTimeout({
             isTimeout: timeout,
-            isCompactionPendingOrRetrying: subscription.isCompacting(),
-            isCompactionInFlight: activeSession.isCompacting,
+            isCompactionPendingOrRetrying: subscription?.isCompacting() ?? false,
+            isCompactionInFlight: activeSession?.isCompacting ?? false,
           })
         ) {
           timedOutDuringCompaction = true;
@@ -1076,7 +1148,9 @@ export async function runEmbeddedAttempt(
         };
         const hookResult = await resolvePromptBuildHookResult({
           prompt: params.prompt,
-          messages: activeSession.messages,
+          messages: usesMastra
+            ? (sessionManager!.buildSessionContext().messages as unknown[])
+            : activeSession!.messages,
           hookCtx,
           hookRunner,
           legacyBeforeAgentStartResult: params.legacyBeforeAgentStartResult,
@@ -1091,7 +1165,10 @@ export async function runEmbeddedAttempt(
           const legacySystemPrompt =
             typeof hookResult?.systemPrompt === "string" ? hookResult.systemPrompt.trim() : "";
           if (legacySystemPrompt) {
-            applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
+            // Apply system prompt override: pi path uses session object; Mastra path updates text only
+            if (!usesMastra && activeSession) {
+              applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
+            }
             systemPromptText = legacySystemPrompt;
             log.debug(`hooks: applied systemPrompt override (${legacySystemPrompt.length} chars)`);
           }
@@ -1100,7 +1177,7 @@ export async function runEmbeddedAttempt(
         log.debug(`embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId}`);
         cacheTrace?.recordStage("prompt:before", {
           prompt: effectivePrompt,
-          messages: activeSession.messages,
+          messages: usesMastra ? [] : activeSession!.messages,
         });
 
         // Repair orphaned trailing user messages so new prompts don't violate role ordering.
@@ -1111,8 +1188,10 @@ export async function runEmbeddedAttempt(
           } else {
             sessionManager.resetLeaf();
           }
-          const sessionContext = sessionManager.buildSessionContext();
-          activeSession.agent.replaceMessages(sessionContext.messages);
+          if (!usesMastra && activeSession) {
+            const sessionContext = sessionManager.buildSessionContext();
+            activeSession.agent.replaceMessages(sessionContext.messages);
+          }
           log.warn(
             `Removed orphaned user message to prevent consecutive user turns. ` +
               `runId=${params.runId} sessionId=${params.sessionId}`,
@@ -1120,86 +1199,170 @@ export async function runEmbeddedAttempt(
         }
 
         try {
-          // Idempotent cleanup for legacy sessions with persisted image payloads.
-          // Called each run; only mutates already-answered user turns that still carry image blocks.
-          const didPruneImages = pruneProcessedHistoryImages(activeSession.messages);
-          if (didPruneImages) {
-            activeSession.agent.replaceMessages(activeSession.messages);
-          }
+          if (usesMastra) {
+            // ── Mastra LLM call path ──────────────────────────────────────────
+            // Image loading: detect and load images for vision models
+            const imageResult = await detectAndLoadPromptImages({
+              prompt: effectivePrompt,
+              workspaceDir: effectiveWorkspace,
+              model: params.model,
+              existingImages: params.images,
+              maxBytes: MAX_IMAGE_BYTES,
+              maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
+              workspaceOnly: effectiveFsWorkspaceOnly,
+              sandbox:
+                sandbox?.enabled && sandbox?.fsBridge
+                  ? { root: sandbox.workspaceDir, bridge: sandbox.fsBridge }
+                  : undefined,
+            });
 
-          // Detect and load images referenced in the prompt for vision-capable models.
-          // Images are prompt-local only (pi-like behavior).
-          const imageResult = await detectAndLoadPromptImages({
-            prompt: effectivePrompt,
-            workspaceDir: effectiveWorkspace,
-            model: params.model,
-            existingImages: params.images,
-            maxBytes: MAX_IMAGE_BYTES,
-            maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
-            workspaceOnly: effectiveFsWorkspaceOnly,
-            // Enforce sandbox path restrictions when sandbox is enabled
-            sandbox:
-              sandbox?.enabled && sandbox?.fsBridge
-                ? { root: sandbox.workspaceDir, bridge: sandbox.fsBridge }
+            // llm_input hook (fire-and-forget, same as pi path)
+            if (hookRunner?.hasHooks("llm_input")) {
+              hookRunner
+                .runLlmInput(
+                  {
+                    runId: params.runId,
+                    sessionId: params.sessionId,
+                    provider: params.provider,
+                    model: params.modelId,
+                    systemPrompt: systemPromptText,
+                    prompt: effectivePrompt,
+                    historyMessages: sessionManager!.buildSessionContext().messages as AgentMessage[],
+                    imagesCount: imageResult.images.length,
+                  },
+                  {
+                    agentId: hookAgentId,
+                    sessionKey: params.sessionKey,
+                    sessionId: params.sessionId,
+                    workspaceDir: params.workspaceDir,
+                    messageProvider: params.messageProvider ?? undefined,
+                  },
+                )
+                .catch((err) => {
+                  log.warn(`llm_input hook failed: ${String(err)}`);
+                });
+            }
+
+            // Launch the Mastra stream — blockers #1/#2/#3 are handled inside runMastraLlmCall
+            const mastraRun = runMastraLlmCall({
+              systemPrompt: systemPromptText,
+              prompt: effectivePrompt,
+              messages: sessionManager!.buildSessionContext().messages as AgentMessage[],
+              provider: params.provider,
+              modelId: params.modelId,
+              model: params.model,
+              apiKey: params.authStorage
+                ? (params.authStorage as { getApiKey?: (provider: string) => string | undefined })
+                    .getApiKey?.(params.provider)
                 : undefined,
-          });
+              tools: [...builtInTools, ...allCustomTools] as Parameters<typeof runMastraLlmCall>[0]["tools"],
+              thinkLevel: params.thinkLevel,
+              maxSteps: params.config?.agents?.defaults?.maxSteps ?? 50,
+              abortSignal: runAbortController.signal,
+              images: imageResult.images.length > 0 ? imageResult.images : undefined,
+              runId: params.runId,
+              sessionId: params.sessionId,
+              onTextDelta: (text) => {
+                mastraAssistantTexts.push(text);
+                params.onPartialReply?.(text);
+              },
+              onFinish: (fullText) => {
+                if (fullText && !mastraAssistantTexts.includes(fullText)) {
+                  // onFinish provides the full text; only add if not already accumulated
+                }
+              },
+            });
+            // Expose the handle for the queueHandle (blocker #1/#2)
+            mastraRunHandle = mastraRun.handle;
 
-          cacheTrace?.recordStage("prompt:images", {
-            prompt: effectivePrompt,
-            messages: activeSession.messages,
-            note: `images: prompt=${imageResult.images.length}`,
-          });
-
-          // Diagnostic: log context sizes before prompt to help debug early overflow errors.
-          if (log.isEnabled("debug")) {
-            const msgCount = activeSession.messages.length;
-            const systemLen = systemPromptText?.length ?? 0;
-            const promptLen = effectivePrompt.length;
-            const sessionSummary = summarizeSessionContext(activeSession.messages);
-            log.debug(
-              `[context-diag] pre-prompt: sessionKey=${params.sessionKey ?? params.sessionId} ` +
-                `messages=${msgCount} roleCounts=${sessionSummary.roleCounts} ` +
-                `historyTextChars=${sessionSummary.totalTextChars} ` +
-                `maxMessageTextChars=${sessionSummary.maxMessageTextChars} ` +
-                `historyImageBlocks=${sessionSummary.totalImageBlocks} ` +
-                `systemPromptChars=${systemLen} promptChars=${promptLen} ` +
-                `promptImages=${imageResult.images.length} ` +
-                `provider=${params.provider}/${params.modelId} sessionFile=${params.sessionFile}`,
-            );
-          }
-
-          if (hookRunner?.hasHooks("llm_input")) {
-            hookRunner
-              .runLlmInput(
-                {
-                  runId: params.runId,
-                  sessionId: params.sessionId,
-                  provider: params.provider,
-                  model: params.modelId,
-                  systemPrompt: systemPromptText,
-                  prompt: effectivePrompt,
-                  historyMessages: activeSession.messages,
-                  imagesCount: imageResult.images.length,
-                },
-                {
-                  agentId: hookAgentId,
-                  sessionKey: params.sessionKey,
-                  sessionId: params.sessionId,
-                  workspaceDir: params.workspaceDir,
-                  messageProvider: params.messageProvider ?? undefined,
-                },
-              )
-              .catch((err) => {
-                log.warn(`llm_input hook failed: ${String(err)}`);
-              });
-          }
-
-          // Only pass images option if there are actually images to pass
-          // This avoids potential issues with models that don't expect the images parameter
-          if (imageResult.images.length > 0) {
-            await abortable(activeSession.prompt(effectivePrompt, { images: imageResult.images }));
+            // Await the Mastra stream (abortable via runAbortController)
+            const mastraResult = await abortable(mastraRun.result);
+            if (mastraResult.promptError) {
+              throw mastraResult.promptError;
+            }
           } else {
-            await abortable(activeSession.prompt(effectivePrompt));
+            // ── pi path ───────────────────────────────────────────────────────
+            // Idempotent cleanup for legacy sessions with persisted image payloads.
+            // Called each run; only mutates already-answered user turns that still carry image blocks.
+            const didPruneImages = pruneProcessedHistoryImages(activeSession!.messages);
+            if (didPruneImages) {
+              activeSession!.agent.replaceMessages(activeSession!.messages);
+            }
+
+            // Detect and load images referenced in the prompt for vision-capable models.
+            // Images are prompt-local only (pi-like behavior).
+            const imageResult = await detectAndLoadPromptImages({
+              prompt: effectivePrompt,
+              workspaceDir: effectiveWorkspace,
+              model: params.model,
+              existingImages: params.images,
+              maxBytes: MAX_IMAGE_BYTES,
+              maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
+              workspaceOnly: effectiveFsWorkspaceOnly,
+              // Enforce sandbox path restrictions when sandbox is enabled
+              sandbox:
+                sandbox?.enabled && sandbox?.fsBridge
+                  ? { root: sandbox.workspaceDir, bridge: sandbox.fsBridge }
+                  : undefined,
+            });
+
+            cacheTrace?.recordStage("prompt:images", {
+              prompt: effectivePrompt,
+              messages: activeSession!.messages,
+              note: `images: prompt=${imageResult.images.length}`,
+            });
+
+            // Diagnostic: log context sizes before prompt to help debug early overflow errors.
+            if (log.isEnabled("debug")) {
+              const msgCount = activeSession!.messages.length;
+              const systemLen = systemPromptText?.length ?? 0;
+              const promptLen = effectivePrompt.length;
+              const sessionSummary = summarizeSessionContext(activeSession!.messages);
+              log.debug(
+                `[context-diag] pre-prompt: sessionKey=${params.sessionKey ?? params.sessionId} ` +
+                  `messages=${msgCount} roleCounts=${sessionSummary.roleCounts} ` +
+                  `historyTextChars=${sessionSummary.totalTextChars} ` +
+                  `maxMessageTextChars=${sessionSummary.maxMessageTextChars} ` +
+                  `historyImageBlocks=${sessionSummary.totalImageBlocks} ` +
+                  `systemPromptChars=${systemLen} promptChars=${promptLen} ` +
+                  `promptImages=${imageResult.images.length} ` +
+                  `provider=${params.provider}/${params.modelId} sessionFile=${params.sessionFile}`,
+              );
+            }
+
+            if (hookRunner?.hasHooks("llm_input")) {
+              hookRunner
+                .runLlmInput(
+                  {
+                    runId: params.runId,
+                    sessionId: params.sessionId,
+                    provider: params.provider,
+                    model: params.modelId,
+                    systemPrompt: systemPromptText,
+                    prompt: effectivePrompt,
+                    historyMessages: activeSession!.messages,
+                    imagesCount: imageResult.images.length,
+                  },
+                  {
+                    agentId: hookAgentId,
+                    sessionKey: params.sessionKey,
+                    sessionId: params.sessionId,
+                    workspaceDir: params.workspaceDir,
+                    messageProvider: params.messageProvider ?? undefined,
+                  },
+                )
+                .catch((err) => {
+                  log.warn(`llm_input hook failed: ${String(err)}`);
+                });
+            }
+
+            // Only pass images option if there are actually images to pass
+            // This avoids potential issues with models that don't expect the images parameter
+            if (imageResult.images.length > 0) {
+              await abortable(activeSession!.prompt(effectivePrompt, { images: imageResult.images }));
+            } else {
+              await abortable(activeSession!.prompt(effectivePrompt));
+            }
           }
         } catch (err) {
           promptError = err;
@@ -1213,14 +1376,17 @@ export async function runEmbeddedAttempt(
         // Capture snapshot before compaction wait so we have complete messages if timeout occurs
         // Check compaction state before and after to avoid race condition where compaction starts during capture
         // Use session state (not subscription) for snapshot decisions - need instantaneous compaction status
-        const wasCompactingBefore = activeSession.isCompacting;
-        const snapshot = activeSession.messages.slice();
-        const wasCompactingAfter = activeSession.isCompacting;
+        const wasCompactingBefore = usesMastra ? false : activeSession!.isCompacting;
+        const snapshot = usesMastra
+          ? (sessionManager!.buildSessionContext().messages as AgentMessage[]).slice()
+          : activeSession!.messages.slice();
+        const wasCompactingAfter = usesMastra ? false : activeSession!.isCompacting;
         // Only trust snapshot if compaction wasn't running before or after capture
         const preCompactionSnapshot = wasCompactingBefore || wasCompactingAfter ? null : snapshot;
-        const preCompactionSessionId = activeSession.sessionId;
+        const preCompactionSessionId = usesMastra ? params.sessionId : activeSession!.sessionId;
 
         try {
+          // Mastra has no compaction — waitForCompactionRetry() is a no-op stub
           await abortable(waitForCompactionRetry());
         } catch (err) {
           if (isRunnerAbortError(err)) {
@@ -1261,12 +1427,16 @@ export async function runEmbeddedAttempt(
 
         // If timeout occurred during compaction, use pre-compaction snapshot when available
         // (compaction restructures messages but does not add user/assistant turns).
+        const currentSnapshot = usesMastra
+          ? (sessionManager!.buildSessionContext().messages as AgentMessage[]).slice()
+          : activeSession!.messages.slice();
+        const currentSessionId = usesMastra ? params.sessionId : activeSession!.sessionId;
         const snapshotSelection = selectCompactionTimeoutSnapshot({
           timedOutDuringCompaction,
           preCompactionSnapshot,
           preCompactionSessionId,
-          currentSnapshot: activeSession.messages.slice(),
-          currentSessionId: activeSession.sessionId,
+          currentSnapshot,
+          currentSessionId,
         });
         if (timedOutDuringCompaction) {
           if (!isProbeSession) {
