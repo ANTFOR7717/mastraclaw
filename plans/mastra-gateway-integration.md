@@ -724,6 +724,171 @@ Recommended default: `50` (matches typical pi-coding-agent behavior for complex 
 
 ---
 
+## 17. Audit Response: 20-Issue Findings vs. MVP Reality
+
+A post-plan audit identified 20 issues beyond the 7 already-known blockers. This section evaluates each against the actual code and the corrected architecture.
+
+### 17.1 The Architectural Finding (Most Important)
+
+The audit's most important finding is correct: **the plan's `if (usesMastra) { return runMastraAgent(...) }` branch at the top of `runEmbeddedAttempt` is the wrong seam.**
+
+[`runEmbeddedAttempt`](src/agents/pi-embedded-runner/run/attempt.ts:329) is an 18-step orchestration pipeline. The Mastra swap should replace only **step 12** — the `createAgentSession()` + `activeSession.prompt()` calls at lines 711–1203 — not the entire function. All surrounding infrastructure (session repair, history sanitization, hooks, abort handling, image loading, tool result guard, etc.) must run regardless of gateway.
+
+**Corrected wiring in `runEmbeddedAttempt`:**
+
+```typescript
+// WRONG (current plan — bypasses all infrastructure):
+if (usesMastra) {
+  return runMastraAgent({ ...params, ... });
+}
+
+// CORRECT (replace only the LLM call, keep all infrastructure):
+// ... all existing setup code runs (lines 332–710) ...
+// Then at the LLM call site (lines 711–1203):
+if (usesMastra) {
+  // Use Mastra agent runner instead of createAgentSession + activeSession.prompt()
+  const mastraResult = await runMastraLlmCall({ ... });
+  // ... rest of teardown code runs (lines 1204–1438) ...
+} else {
+  ({ session } = await createAgentSession({ ... }));
+  await abortable(activeSession.prompt(effectivePrompt));
+}
+```
+
+With this corrected architecture, the following issues from the audit **disappear entirely** because the surrounding code already handles them:
+- Session file repair (line 620)
+- Plugin hooks: `before_prompt_build`, `llm_input`, `agent_end`, `llm_output` (lines 1077, 1171, 1310, 1367)
+- `clientTools` / OpenResponses (lines 690–709)
+- Image pruning (line 1125)
+- Image injection (line 1132)
+- Orphaned user message repair (lines 1107–1120)
+- Abort timer and timeout handling (lines 998–1057)
+- `setActiveEmbeddedRun` / `clearActiveEmbeddedRun` registration (lines 996, 1351)
+
+### 17.2 Issue-by-Issue Assessment
+
+#### Critical Issues (Audit: 2)
+
+**Issue #1 — `queueMessage` / `steer()` — mid-run message injection**
+
+**Real MVP blocker: YES.**
+
+[`runs.ts:21-38`](src/agents/pi-embedded-runner/runs.ts:21) calls `handle.queueMessage(text)` → `activeSession.steer(text)` ([`attempt.ts:990`](src/agents/pi-embedded-runner/run/attempt.ts:990)). Mastra's `Agent.stream()` returns a stream with no mid-stream injection API. There is no `steer()` equivalent.
+
+Under the corrected architecture, the `queueHandle` registration at line 996 runs regardless of gateway. But `queueHandle.queueMessage` must call something — and for Mastra, there is nothing to call mid-stream.
+
+**MVP mitigation:** For Phase 1, document that mid-run message injection is not supported in Mastra mode. The `queueMessage` implementation in the Mastra path can queue the message and replay it as a new turn after the current stream completes (same behavior as when `isStreaming()` returns false). This is a behavioral degradation, not a crash.
+
+**Issue #2 — `isStreaming` / `isCompacting` state**
+
+**Real MVP blocker: YES, but small.**
+
+The `queueHandle` at [`attempt.ts:988-995`](src/agents/pi-embedded-runner/run/attempt.ts:988) exposes `isStreaming()` and `isCompacting()` to the gateway run registry. The abort timer at line 1007 checks `subscription.isCompacting()` and `activeSession.isCompacting`.
+
+Under the corrected architecture, the `queueHandle` is constructed in the shared code. The Mastra runner must expose equivalent state. This is a small implementation task: the Mastra agent-runner tracks a `streaming` boolean (set true when `agent.stream()` is called, false when it resolves) and always returns `false` for `isCompacting()` (Mastra has no compaction concept).
+
+**MVP fix:** Mastra agent-runner exposes `{ isStreaming: () => boolean; isCompacting: () => boolean }` interface. Two lines of state tracking.
+
+#### High Issues (Audit: 5)
+
+**Issue #3 — `streamFn` wrapping pipeline (5 layers of sanitization)**
+
+**Real MVP blocker: PARTIAL — overstated by audit.**
+
+The 7 wrappers at [`attempt.ts:770-853`](src/agents/pi-embedded-runner/run/attempt.ts:770) are pi-specific. Mastra has no `streamFn`. However, the **functionality** must be replicated:
+
+| Wrapper | MVP needed? | Mastra equivalent |
+|---------|-------------|-------------------|
+| Ollama native API bypass | YES (if Ollama used) | Use `OpenAICompatibleConfig` with Ollama URL |
+| `applyExtraParamsToAgent` | Partial (see #4) | `agent.stream(messages, { temperature, maxTokens })` |
+| `cacheTrace.wrapStreamFn` | NO (diagnostic only) | Skip for MVP |
+| `dropThinkingBlocks` (Copilot/Claude) | YES for Copilot | Pre-process messages before `toCoreMessages()` |
+| `sanitizeToolCallIds` (Mistral/Google) | YES for Mistral/Google | Pre-process messages before `toCoreMessages()` |
+| `wrapStreamFnTrimToolCallNames` | YES (safety net) | Post-process Mastra stream events |
+| `anthropicPayloadLogger` | NO (diagnostic only) | Skip for MVP |
+
+For MVP targeting Anthropic direct + OpenAI: only tool name trimming is needed. For Copilot/Mistral/Google: thinking block drop and tool call ID normalization are needed. These are pre/post-processing steps on the message array, not `streamFn` wrappers.
+
+**Issue #4 — `applyExtraParamsToAgent` — temperature, maxTokens, Anthropic betas, OpenRouter routing**
+
+**Real MVP blocker: NO for basic usage, YES for advanced providers.**
+
+- Temperature/maxTokens: Mastra's `agent.stream(messages, { temperature, maxTokens })` — **natively supported**
+- Anthropic prompt caching: Mastra's `providerOptions.anthropic` — **supported**
+- Anthropic 1M context beta: inject `anthropic-beta` header in `OpenAICompatibleConfig.headers` — **supported**
+- OpenRouter routing: inject `provider` field via `onPayload` equivalent — **needs custom wrapper**
+- SiliconFlow/Z.AI/Codex quirks: provider-specific, can be added incrementally
+
+**MVP scope:** Temperature, maxTokens, and Anthropic betas are needed. OpenRouter routing and provider-specific quirks can be Phase 2.
+
+**Issue #5 — `installToolResultContextGuard` — no tool result size guard**
+
+**Real MVP blocker: YES for coding agent use cases.**
+
+[`tool-result-context-guard.ts:297-336`](src/agents/pi-embedded-runner/tool-result-context-guard.ts:297) hooks into `agent.transformContext` — a pi-agent-core private API. Mastra has no equivalent hook.
+
+Without this guard, reading a large file (e.g., 500KB) will overflow the context window and cause a provider error. For any real coding agent task, this will trigger.
+
+**MVP fix:** Implement equivalent truncation in the Mastra message adapter. Before calling `agent.stream(coreMessages)`, run `enforceToolResultContextBudgetInPlace()` on the converted messages. The logic in `tool-result-context-guard.ts` is pure and can be called directly — it doesn't depend on pi-agent-core internals beyond the `AgentMessage` type.
+
+**Issue #6 — `sanitizeSessionHistory` / turn validation**
+
+**Real MVP blocker: YES for Gemini and Anthropic.**
+
+[`attempt.ts:856-887`](src/agents/pi-embedded-runner/run/attempt.ts:856) runs `sanitizeSessionHistory`, `validateGeminiTurns`, `validateAnthropicTurns`, and `sanitizeToolUseResultPairing`. These are **pure functions** that operate on `AgentMessage[]` — they have no pi-agent-core runtime dependency beyond the type.
+
+**MVP fix:** Call these functions in the Mastra path before `toCoreMessages()`. This is already the correct place in the corrected architecture (the sanitization runs in the shared code before the LLM call branch). The plan's `session-manager-compat.ts` should explicitly include this step.
+
+**Issue #14 — `transcriptPolicy` — provider-specific message format rules**
+
+**Real MVP blocker: NO (it's the driver for #3 and #6, not a standalone issue).**
+
+`resolveTranscriptPolicy()` at [`transcript-policy.ts:78-132`](src/agents/transcript-policy.ts:78) is already called in the shared code at [`attempt.ts:629-633`](src/agents/pi-embedded-runner/run/attempt.ts:629). Under the corrected architecture, the policy is computed before the LLM call branch and can be passed to the Mastra runner. Not a standalone blocker.
+
+#### Medium Issues (Audit: 9)
+
+| Issue | Real blocker? | Reason |
+|-------|--------------|--------|
+| Image pruning | NO | `pruneProcessedHistoryImages()` is a pure function; runs in shared code under corrected architecture |
+| Image injection | NO | `detectAndLoadPromptImages()` runs in shared code; images passed to Mastra via `CoreMessage` content |
+| Session file repair | NO | `repairSessionFileIfNeeded()` runs before LLM call in shared code |
+| Orphaned user message repair | NO | Lines 1107–1120 run in shared code |
+| `before_prompt_build` hook | NO | Lines 1077–1098 run in shared code |
+| `llm_input` hook | NO | Lines 1171–1195 run in shared code |
+| `agent_end` hook | NO | Lines 1310–1330 run in shared code |
+| `llm_output` hook | NO | Lines 1367–1390 run in shared code |
+| `clientTools` (OpenResponses) | NO | Lines 690–709 run in shared code; client tool defs passed to Mastra |
+| Compaction timeout handling | PARTIAL | Mastra has no compaction; `timedOutDuringCompaction` always false in Mastra mode |
+| `reasoningLevel` mapping | NO | Already addressed in plan section 7 via `providerOptions` |
+
+#### Low Issues (Audit: 4)
+
+These are all non-blockers under the corrected architecture (they run in shared code) or are diagnostic/logging features that can be skipped for MVP.
+
+### 17.3 Revised MVP Blocker List
+
+With the corrected architecture (replace only the LLM call, not the entire function), the genuine MVP blockers reduce to **4 items**:
+
+| # | Issue | Fix complexity |
+|---|-------|---------------|
+| 1 | `steer()` / mid-run injection | Low: queue for next turn; document as behavioral change |
+| 2 | `isStreaming` / `isCompacting` state | Low: two boolean flags in Mastra runner |
+| 5 | Tool result context guard | Medium: call existing `enforceToolResultContextBudgetInPlace()` before `agent.stream()` |
+| 6 | `sanitizeSessionHistory` / turn validation | Low: call existing sanitization functions before `toCoreMessages()` |
+
+The audit's 7 "already-known blockers" plus these 4 = **11 total items** to address for a working MVP. The remaining 9 medium and 4 low issues are either non-issues under the corrected architecture or can be addressed incrementally in Phase 2.
+
+### 17.4 Required Plan Updates
+
+1. **Section 6.2** — Correct the wiring to replace only the LLM call, not the entire function
+2. **Section 4.5** — `agent-runner.ts` must expose `isStreaming()` and `isCompacting()` state
+3. **Section 4.5** — `agent-runner.ts` must call `enforceToolResultContextBudgetInPlace()` before `agent.stream()`
+4. **Section 4.2** — `message-adapter.ts` must call `sanitizeSessionHistory` + turn validation before `toCoreMessages()`
+5. **Section 4.5** — Document that mid-run `steer()` is not supported in Mastra mode for Phase 1
+6. **Section 13** — Add steps for the 4 new fixes to the implementation sequence
+
+---
+
 ## 16. References
 
 - [Mastra v1.8.0 on npm](https://www.npmjs.com/package/@mastra/core/v/1.8.0)
