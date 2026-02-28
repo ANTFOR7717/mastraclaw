@@ -1,7 +1,7 @@
 # Plan: Power OpenClaw's LLM Gateway with Mastra
 
-**Status:** Draft — awaiting review  
-**Branch target:** `main`  
+**Status:** Draft — awaiting review (Audit 2 blockers applied 2026-02-28)
+**Branch target:** `main`
 **Scope:** Replace the `@mariozechner/pi-*` LLM execution stack with Mastra as the AI gateway engine. No TUI changes. No session format migration. Existing JSONL session files are preserved as-is.
 
 ---
@@ -166,15 +166,17 @@ Channel message
 
 ```
 src/agents/mastra/
-  index.ts                  — public re-exports
-  types.ts                  — internal shared types
-  message-adapter.ts        — AgentMessage[] ↔ CoreMessage[]
-  tool-adapter.ts           — AgentTool (TypeBox) → ToolAction (Zod/Mastra)
-  model-config.ts           — OpenClaw ModelProviderConfig → MastraModelConfig
-  agent-runner.ts           — replaces createAgentSession + runEmbeddedAttempt inner loop
-  stream-subscriber.ts      — replaces subscribeEmbeddedPiSession for Mastra streams
-  compaction.ts             — replaces generateSummary / estimateTokens
-  session-manager-compat.ts — thin SessionManager-compatible wrapper (reads/writes JSONL)
+  index.ts                      — public re-exports
+  types.ts                      — internal shared types
+  message-adapter.ts            — AgentMessage[] ↔ CoreMessage[]
+  tool-adapter.ts               — AgentTool (TypeBox) → ToolAction (Zod/Mastra)
+  model-config.ts               — OpenClaw ModelProviderConfig → MastraModelConfig (with @ai-sdk/anthropic branch)
+  agent-runner.ts               — replaces createAgentSession + runEmbeddedAttempt inner loop
+  mastra-event-feed.ts          — MastraEventFeed and MastraSessionEvent types [Blocker 1]
+  subscribe-mastra-session.ts   — subscribeMastraSession() — new function replacing subscribeEmbeddedPiSession [Blocker 1]
+  stream-subscriber.ts          — internal Mastra fullStream → MastraSessionEvent translator
+  compaction.ts                 — full compaction with JSONL write-back [Blocker 4]
+  session-manager-compat.ts     — thin SessionManager-compatible wrapper (reads/writes JSONL)
 ```
 
 ### 4.2 Message Adapter
@@ -250,9 +252,16 @@ Maps OpenClaw's `ModelProviderConfig` + `ModelApi` to Mastra's `MastraModelConfi
 ```typescript
 // src/agents/mastra/model-config.ts
 
+import { createAnthropic } from "@ai-sdk/anthropic";
 import type { MastraModelConfig, OpenAICompatibleConfig } from "@mastra/core/llm";
 import type { ModelApi } from "../../config/types.models.js";
 
+// [Blocker 6] Anthropic uses a completely different wire format from OpenAI:
+// - Different tool schema shape (input_schema vs function.parameters)
+// - Different content block format (typed blocks vs strings)
+// - Required anthropic-version header
+// - Different streaming event format
+// OpenAICompatibleConfig CANNOT be used for anthropic-messages.
 export function toMastraModelConfig(params: {
   provider: string;
   modelId: string;
@@ -261,26 +270,72 @@ export function toMastraModelConfig(params: {
   apiKey?: string;
   headers?: Record<string, string>;
 }): MastraModelConfig {
-  // Use OpenAICompatibleConfig for all providers — Mastra routes via the url/apiKey
-  // This avoids needing separate @ai-sdk/* packages for each provider.
-  const config: OpenAICompatibleConfig = {
-    id: `${params.provider}/${params.modelId}`,
-    url: resolveProviderBaseUrl(params.modelApi, params.baseUrl),
-    apiKey: params.apiKey,
-    headers: params.headers,
-  };
-  return config;
+  switch (params.modelApi) {
+    case "anthropic-messages": {
+      // Must use @ai-sdk/anthropic — NOT OpenAICompatibleConfig.
+      // For standard API keys (sk-ant-api03-*): pass as apiKey (sent as x-api-key).
+      // For OAuth tokens (sk-ant-oat-*): pass via headers as Authorization: Bearer.
+      const isOAuthToken = params.apiKey?.startsWith("sk-ant-oat-");
+      const provider = createAnthropic({
+        apiKey: isOAuthToken ? undefined : params.apiKey,
+        baseURL: params.baseUrl,
+        headers: isOAuthToken
+          ? {
+              "Authorization": `Bearer ${params.apiKey}`,
+              "anthropic-version": "2023-06-01",
+              ...params.headers,
+            }
+          : params.headers,
+      });
+      return provider(params.modelId);
+    }
+
+    case "openai-completions":
+    case "openai-responses":
+    case "openai-codex-responses":
+    case "ollama":
+    case "github-copilot": {
+      // These are genuinely OpenAI-compatible
+      const config: OpenAICompatibleConfig = {
+        id: `${params.provider}/${params.modelId}`,
+        url: resolveProviderBaseUrl(params.modelApi, params.baseUrl),
+        apiKey: params.apiKey,
+        headers: params.headers,
+      };
+      return config;
+    }
+
+    case "google-generative-ai": {
+      // @ai-sdk/google handles Google OAuth and API key auth
+      const { google } = await import("@ai-sdk/google");
+      return google(params.modelId);
+    }
+
+    case "bedrock-converse-stream": {
+      // @ai-sdk/amazon-bedrock handles AWS SigV4 signing
+      const { bedrock } = await import("@ai-sdk/amazon-bedrock");
+      return bedrock(params.modelId);
+    }
+
+    default: {
+      // Fallback for unknown providers: attempt OpenAI-compatible
+      const config: OpenAICompatibleConfig = {
+        id: `${params.provider}/${params.modelId}`,
+        url: params.baseUrl,
+        apiKey: params.apiKey,
+        headers: params.headers,
+      };
+      return config;
+    }
+  }
 }
 
 function resolveProviderBaseUrl(api: ModelApi, customBaseUrl?: string): string | undefined {
   if (customBaseUrl) return customBaseUrl;
   switch (api) {
-    case "anthropic-messages": return "https://api.anthropic.com/v1";
     case "openai-completions":
     case "openai-responses":
     case "openai-codex-responses": return "https://api.openai.com/v1";
-    case "google-generative-ai": return "https://generativelanguage.googleapis.com/v1beta";
-    case "bedrock-converse-stream": return undefined; // AWS SDK handles this
     case "ollama": return "http://localhost:11434/v1";
     case "github-copilot": return "https://api.githubcopilot.com";
     default: return undefined;
@@ -288,7 +343,7 @@ function resolveProviderBaseUrl(api: ModelApi, customBaseUrl?: string): string |
 }
 ```
 
-**Important:** For providers that need native SDK support (Bedrock with AWS SigV4, Google OAuth), we use the corresponding `@ai-sdk/*` package directly as a `LanguageModelV1`. For OpenAI-compatible providers (Anthropic, OpenAI, Ollama, OpenRouter, etc.), `OpenAICompatibleConfig` is sufficient.
+**Important:** Anthropic's API is **not** OpenAI-compatible. The wire format differs in tool schema shape, content block format, required headers, and streaming event format. `@ai-sdk/anthropic` must be used for `anthropic-messages`. For providers that need native SDK support (Bedrock with AWS SigV4, Google OAuth), we use the corresponding `@ai-sdk/*` package directly as a `LanguageModelV1`. For genuinely OpenAI-compatible providers (OpenAI, Ollama, GitHub Copilot, OpenRouter), `OpenAICompatibleConfig` is sufficient.
 
 ### 4.5 Agent Runner
 
@@ -309,17 +364,33 @@ export async function runMastraAgent(params: {
   modelId: string;
   modelApi: ModelApi;
   baseUrl?: string;
+  // [Blocker 3] apiKey must be resolved via resolveModelAuthMode() + getApiKeyForModel()
+  // BEFORE calling runMastraAgent. The caller (attempt.ts) is responsible for auth resolution.
+  // Do NOT pass Model<Api> here — extract the resolved apiKey and headers first.
   apiKey?: string;
+  headers?: Record<string, string>;
   systemPrompt: string;
   messages: AgentMessage[];
   tools: AgentTool[];
   thinkLevel?: ThinkLevel;
-  onTextDelta: (text: string) => void;
-  onToolCall: (name: string, input: unknown) => void;
-  onToolResult: (name: string, result: unknown) => void;
-  onFinish: (result: MastraRunResult) => void;
+  config?: OpenClawConfig;
   signal?: AbortSignal;
 }): Promise<MastraRunResult> {
+  // [Blocker 5] Validate unsupported extension modes before starting
+  const compactionMode = params.config?.agents?.defaults?.compaction?.mode;
+  const contextPruningMode = params.config?.agents?.defaults?.contextPruning?.mode;
+  if (compactionMode === "safeguard") {
+    throw new ConfigurationError(
+      "agents.defaults.compaction.mode = 'safeguard' is not supported with gateway = 'mastra'. " +
+      "Use gateway = 'pi' for compaction safeguard support, or set compaction.mode = 'default'."
+    );
+  }
+  if (contextPruningMode === "cache-ttl") {
+    throw new ConfigurationError(
+      "agents.defaults.contextPruning.mode = 'cache-ttl' is not supported with gateway = 'mastra'."
+    );
+  }
+
   const mastraTools = Object.fromEntries(
     params.tools.map((t) => [t.name, adaptToolForMastra(t)])
   );
@@ -334,29 +405,26 @@ export async function runMastraAgent(params: {
       modelApi: params.modelApi,
       baseUrl: params.baseUrl,
       apiKey: params.apiKey,
+      headers: params.headers,
     }),
     tools: mastraTools,
   });
 
   const coreMessages = toCoreMessages(params.messages);
-  const output = await agent.stream(coreMessages);
 
-  // Consume the stream and emit events compatible with subscribeEmbeddedPiSession
-  for await (const chunk of output.fullStream) {
-    if (chunk.type === "text-delta") {
-      params.onTextDelta(chunk.textDelta);
-    } else if (chunk.type === "tool-call") {
-      params.onToolCall(chunk.toolName, chunk.args);
-    } else if (chunk.type === "tool-result") {
-      params.onToolResult(chunk.toolName, chunk.result);
-    }
-  }
+  // [Blocker 7] maxSteps: pi path has no hard step limit. Use 200 as a safety ceiling.
+  // Most agents finish in <50 steps; complex refactoring tasks can exceed 100.
+  // Document: gateway = "mastra" will truncate agents that exceed maxSteps.
+  // For agents requiring unlimited tool call loops, use gateway = "pi" until
+  // Mastra-native compaction is implemented (Phase 2).
+  const output = await agent.stream(coreMessages, {
+    maxSteps: params.config?.agents?.defaults?.maxSteps ?? 200,
+    providerOptions: toMastraProviderOptions(params.thinkLevel, params.provider),
+  });
 
-  const finalText = await output.text;
-  const toolCalls = await output.toolCalls;
-  const toolResults = await output.toolResults;
-
-  return { text: finalText, toolCalls, toolResults };
+  // Emit events via subscribeMastraSession (see subscribe-mastra-session.ts)
+  // The fullStream is passed to subscribeMastraSession, not consumed inline here.
+  return { stream: output };
 }
 ```
 
@@ -371,26 +439,57 @@ This means:
 
 ### 4.7 Compaction Adapter
 
-The current compaction uses `generateSummary` from pi-coding-agent. The Mastra adapter uses `agent.generate()`:
+The current compaction uses `generateSummary` from pi-coding-agent. The Mastra adapter uses `agent.generate()`.
+
+**[Blocker 4]** The plan must specify the full compaction path, not just `mastraGenerateSummary`. Compaction requires:
+1. Generating the summary text via `agent.generate()`
+2. Determining `firstKeptMessageIndex` — the index of the first message to keep after compaction
+3. Acquiring the session write lock before modifying the JSONL file
+4. Writing the compacted messages back to the JSONL session file atomically
+5. Releasing the write lock
 
 ```typescript
 // src/agents/mastra/compaction.ts
 
-export async function mastraGenerateSummary(params: {
+export async function mastraCompact(params: {
+  sessionId: string;
+  sessionFilePath: string;
   messages: AgentMessage[];
   model: MastraModelConfig;
-  systemPrompt: string;
-}): Promise<string> {
+  compactionPrompt: string;
+  sessionWriteLock: SessionWriteLock;  // same lock used by pi path
+}): Promise<{ compactedMessages: AgentMessage[]; summaryText: string }> {
+  // Step 1: Generate summary using agent.generate() (non-streaming)
   const agent = new Agent({
     id: "openclaw-compaction",
     name: "Compaction Agent",
-    instructions: params.systemPrompt,
+    instructions: params.compactionPrompt,
     model: params.model,
     tools: {},
   });
-
   const result = await agent.generate(toCoreMessages(params.messages));
-  return result.text;
+  const summaryText = result.text;
+
+  // Step 2: Determine firstKeptMessageIndex
+  // Keep the last N messages that fit within the context window after compaction.
+  // This mirrors the pi path's compaction logic in compact.ts.
+  const firstKeptMessageIndex = resolveFirstKeptMessageIndex(params.messages);
+
+  // Step 3: Build compacted message list
+  // [summary as user message] + [kept messages from firstKeptMessageIndex onward]
+  const summaryMessage: AgentMessage = {
+    role: "user",
+    content: `[Conversation summary]\n${summaryText}`,
+  };
+  const keptMessages = params.messages.slice(firstKeptMessageIndex);
+  const compactedMessages = [summaryMessage, ...keptMessages];
+
+  // Step 4: Acquire write lock and write back to JSONL
+  await params.sessionWriteLock.withLock(async () => {
+    await writeSessionMessagesToJsonl(params.sessionFilePath, compactedMessages);
+  });
+
+  return { compactedMessages, summaryText };
 }
 
 export function mastraEstimateTokens(text: string): number {
@@ -400,6 +499,8 @@ export function mastraEstimateTokens(text: string): number {
 }
 ```
 
+**Note:** `resolveFirstKeptMessageIndex` and `writeSessionMessagesToJsonl` are shared utilities from `src/agents/pi-embedded-runner/` — the Mastra compaction path reuses the same JSONL write logic as the pi path to ensure format consistency.
+
 ---
 
 ## 5. Provider Support Matrix
@@ -408,7 +509,7 @@ All 8 `ModelApi` values in [`src/config/types.models.ts`](src/config/types.model
 
 | `ModelApi` | Mastra approach | Notes |
 |---|---|---|
-| `anthropic-messages` | `OpenAICompatibleConfig` with Anthropic base URL | Anthropic API is OpenAI-compatible for basic calls |
+| `anthropic-messages` | `@ai-sdk/anthropic` `LanguageModelV1` | **NOT OpenAI-compatible** — different wire format, tool schema, content blocks, required headers [Blocker 6] |
 | `openai-completions` | `OpenAICompatibleConfig` | Direct OpenAI endpoint |
 | `openai-responses` | `OpenAICompatibleConfig` | Responses API endpoint |
 | `openai-codex-responses` | `OpenAICompatibleConfig` | Codex endpoint |
@@ -419,11 +520,12 @@ All 8 `ModelApi` values in [`src/config/types.models.ts`](src/config/types.model
 
 **New dependencies required:**
 - `@mastra/core` — core framework (already has `@ai-sdk/provider-v5` and `@ai-sdk/provider-v6` bundled)
+- `@ai-sdk/anthropic` — for Anthropic (native wire format required — NOT OpenAI-compatible) [Blocker 6]
 - `@ai-sdk/google` — for Google Generative AI (native auth)
 - `@ai-sdk/amazon-bedrock` — for Bedrock (AWS SigV4)
 - `ai` — Vercel AI SDK core (peer dep of `@mastra/core`)
 
-**No new dependencies needed for:** Anthropic, OpenAI, Ollama, GitHub Copilot, OpenRouter, and any other OpenAI-compatible provider.
+**No new dependencies needed for:** OpenAI, Ollama, GitHub Copilot, OpenRouter, and other genuinely OpenAI-compatible providers.
 
 ---
 
@@ -449,7 +551,22 @@ The flag is checked in [`src/agents/pi-embedded-runner/run/attempt.ts`](src/agen
 const usesMastra = params.config?.agents?.defaults?.gateway === "mastra";
 
 if (usesMastra) {
-  return runMastraAgent({ ...params, onTextDelta, onToolCall, onToolResult, onFinish });
+  // [Blocker 3] Auth must be resolved BEFORE calling runMastraAgent.
+  // resolveModelAuthMode() + getApiKeyForModel() extract the apiKey and headers
+  // from the Model<Api> object. Do NOT pass Model<Api> to runMastraAgent.
+  const authMode = resolveModelAuthMode(params.model);
+  const { apiKey, headers } = await getApiKeyForModel(params.model, authMode);
+
+  // [Blocker 2] lastAssistant must be constructed from Mastra output, not from AgentSession.
+  // buildLastAssistantFromMastra() converts the final CoreMessage[] from the Mastra run
+  // into the AssistantMessage shape expected by the rest of the pi-embedded-runner.
+  const mastraResult = await runMastraAgent({
+    ...params,
+    apiKey,
+    headers,
+  });
+  const lastAssistant = buildLastAssistantFromMastra(mastraResult);
+  return { lastAssistant, ...mastraResult };
 } else {
   // existing pi-coding-agent path unchanged
   ({ session } = await createAgentSession({ ... }));
@@ -457,7 +574,9 @@ if (usesMastra) {
 }
 ```
 
-The Mastra path emits the same events as the pi path so `subscribeEmbeddedPiSession` and all downstream consumers work without changes.
+**[Blocker 1]** `subscribeEmbeddedPiSession` **cannot** be reused for the Mastra path. It calls `params.session.subscribe(handler)` directly on an `AgentSession` object from pi-coding-agent, and uses `session.isCompacting`, `session.abortCompaction()`, `session.steer()`, `session.prompt()`, `session.abort()`, `session.dispose()`, and `session.agent.replaceMessages()`. None of these exist on a Mastra agent.
+
+Instead, `subscribeMastraSession()` in `src/agents/mastra/subscribe-mastra-session.ts` provides the same output contract (same `assistantTexts`, `toolMetas`, compaction events) by consuming the Mastra `fullStream` via `MastraEventFeed`.
 
 ---
 
@@ -481,11 +600,13 @@ The `toMastraStreamOptions` helper in `src/agents/mastra/model-config.ts` maps O
 
 ## 8. Streaming Event Compatibility
 
-The existing `subscribeEmbeddedPiSession` in [`src/agents/pi-embedded-subscribe.ts`](src/agents/pi-embedded-subscribe.ts:1) consumes a stream of `AgentEvent` objects from pi-agent-core. The Mastra stream emits `ChunkType` events from the Vercel AI SDK.
+**[Blocker 1 — CORRECTED]** `subscribeEmbeddedPiSession` in [`src/agents/pi-embedded-subscribe.ts`](src/agents/pi-embedded-subscribe.ts:1) **cannot be reused** for the Mastra path. It directly calls `params.session.subscribe(handler)` on an `AgentSession` object from pi-coding-agent, and uses 11 members of `AgentSession` that do not exist on a Mastra agent (`isCompacting`, `abortCompaction()`, `steer()`, `prompt()`, `abort()`, `dispose()`, `agent.replaceMessages()`, etc.).
 
-The `stream-subscriber.ts` adapter translates Mastra's `fullStream` chunks into the same `AgentEvent` shape:
+Instead, a new `subscribeMastraSession()` function in `src/agents/mastra/subscribe-mastra-session.ts` provides the **same output contract** as `subscribeEmbeddedPiSession` by consuming the Mastra `fullStream` via `MastraEventFeed`:
 
-| Mastra chunk type | pi-agent-core AgentEvent equivalent |
+The `stream-subscriber.ts` module translates Mastra's `fullStream` chunks into `MastraSessionEvent` objects:
+
+| Mastra chunk type | MastraSessionEvent equivalent |
 |---|---|
 | `text-delta` | `{ type: "text", text: delta }` |
 | `tool-call` | `{ type: "toolCall", name, input }` |
@@ -493,7 +614,7 @@ The `stream-subscriber.ts` adapter translates Mastra's `fullStream` chunks into 
 | `finish` | `{ type: "finish", finishReason, usage }` |
 | `error` | `{ type: "error", error }` |
 
-This means `subscribeEmbeddedPiSession` and all its callers (Telegram, Discord, Slack, etc.) are **unchanged**.
+`subscribeMastraSession()` consumes `MastraSessionEvent` objects and produces the same `assistantTexts`, `toolMetas`, and compaction events as `subscribeEmbeddedPiSession`. All downstream consumers (Telegram, Discord, Slack, etc.) are **unchanged** — they call `subscribeMastraSession` instead of `subscribeEmbeddedPiSession` when `gateway = "mastra"`.
 
 ---
 
@@ -508,27 +629,31 @@ This means `subscribeEmbeddedPiSession` and all its callers (Telegram, Discord, 
 | `src/agents/mastra/message-adapter.ts` | `AgentMessage[]` ↔ `CoreMessage[]` |
 | `src/agents/mastra/tool-adapter.ts` | `AgentTool` → Mastra `ToolAction` |
 | `src/agents/mastra/typebox-to-zod.ts` | TypeBox schema → Zod schema converter |
-| `src/agents/mastra/model-config.ts` | `ModelProviderConfig` → `MastraModelConfig` |
+| `src/agents/mastra/model-config.ts` | `ModelProviderConfig` → `MastraModelConfig` (with `@ai-sdk/anthropic` branch) |
 | `src/agents/mastra/agent-runner.ts` | Main Mastra execution loop |
-| `src/agents/mastra/stream-subscriber.ts` | Mastra stream → `AgentEvent` adapter |
-| `src/agents/mastra/compaction.ts` | `mastraGenerateSummary`, `mastraEstimateTokens` |
+| `src/agents/mastra/mastra-event-feed.ts` | `MastraEventFeed` and `MastraSessionEvent` types [Blocker 1] |
+| `src/agents/mastra/subscribe-mastra-session.ts` | `subscribeMastraSession()` — replaces `subscribeEmbeddedPiSession` for Mastra path [Blocker 1] |
+| `src/agents/mastra/stream-subscriber.ts` | Internal Mastra `fullStream` → `MastraSessionEvent` translator |
+| `src/agents/mastra/compaction.ts` | `mastraCompact()` with full JSONL write-back [Blocker 4] |
 | `src/agents/mastra/session-manager-compat.ts` | JSONL read/write wrapper for Mastra path |
 | `src/agents/mastra/message-adapter.test.ts` | Unit tests |
 | `src/agents/mastra/tool-adapter.test.ts` | Unit tests |
 | `src/agents/mastra/typebox-to-zod.test.ts` | Unit tests |
 | `src/agents/mastra/model-config.test.ts` | Unit tests |
 | `src/agents/mastra/agent-runner.test.ts` | Integration tests (mocked provider) |
+| `src/agents/mastra/subscribe-mastra-session.test.ts` | Unit tests: text streaming, tool calls, compaction events, abort, messaging tool tracking [Blocker 1] |
 
 ### 9.2 Modified Files
 
 | File | Change |
 |---|---|
-| [`src/agents/pi-embedded-runner/run/attempt.ts`](src/agents/pi-embedded-runner/run/attempt.ts:711) | Add `if (usesMastra)` branch; import `runMastraAgent` |
-| [`src/agents/pi-embedded-runner/compact.ts`](src/agents/pi-embedded-runner/compact.ts:572) | Add Mastra branch for compaction using `mastraGenerateSummary` |
+| [`src/agents/pi-embedded-runner/run/attempt.ts`](src/agents/pi-embedded-runner/run/attempt.ts:711) | Add `if (usesMastra)` branch; resolve auth via `resolveModelAuthMode` + `getApiKeyForModel` before calling `runMastraAgent`; add config validation for unsupported extension modes [Blockers 2, 3, 5] |
+| [`src/agents/pi-embedded-runner/run/types.ts`](src/agents/pi-embedded-runner/run/types.ts:1) | Add `buildLastAssistantFromMastra()` — constructs `AssistantMessage` from Mastra `CoreMessage[]` output [Blocker 2] |
+| [`src/agents/pi-embedded-runner/compact.ts`](src/agents/pi-embedded-runner/compact.ts:572) | Add Mastra branch for compaction using `mastraCompact()` (full JSONL write-back) [Blocker 4] |
 | [`src/config/types.agents.ts`](src/config/types.agents.ts:1) | Add `gateway?: "pi" \| "mastra"` |
 | [`src/config/zod-schema.agent-defaults.ts`](src/config/zod-schema.agent-defaults.ts:1) | Add Zod validation for `gateway` |
 | [`src/config/schema.ts`](src/config/schema.ts:1) | Add schema help text for `agents.defaults.gateway` |
-| `package.json` | Add `@mastra/core`, `@ai-sdk/google`, `@ai-sdk/amazon-bedrock`, `ai` |
+| `package.json` | Add `@mastra/core`, `@ai-sdk/anthropic`, `@ai-sdk/google`, `@ai-sdk/amazon-bedrock`, `ai` [Blocker 6] |
 
 ### 9.3 Unchanged Files
 
@@ -543,13 +668,16 @@ Everything else: all channel files, routing, CLI, gateway HTTP/WS server, sessio
 ```json
 {
   "@mastra/core": "1.8.0",
+  "@ai-sdk/anthropic": "^1.2.0",
   "@ai-sdk/google": "^1.2.0",
   "@ai-sdk/amazon-bedrock": "^1.2.0",
   "ai": "^4.3.0"
 }
 ```
 
-> Per AGENTS.md: `@mastra/core` must use exact version `1.8.0` since it will be in `pnpm.patchedDependencies` if any patches are needed. `@ai-sdk/google` and `@ai-sdk/amazon-bedrock` can use `^` since they are not patched.
+> Per AGENTS.md: `@mastra/core` must use exact version `1.8.0` since it will be in `pnpm.patchedDependencies` if any patches are needed. `@ai-sdk/anthropic`, `@ai-sdk/google`, and `@ai-sdk/amazon-bedrock` can use `^` since they are not patched.
+>
+> **[Blocker 6]** `@ai-sdk/anthropic` is required because Anthropic's API is NOT OpenAI-compatible. The wire format differs in tool schema shape, content block format, required headers (`anthropic-version`), and streaming event format. `OpenAICompatibleConfig` will return HTTP 400 errors when used with `api.anthropic.com`.
 
 ### 10.2 Removed Dependencies (Phase 2 — after parity confirmed)
 
@@ -600,11 +728,16 @@ Everything else: all channel files, routing, CLI, gateway HTTP/WS server, sessio
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Mastra `fullStream` event shape differs from pi-agent-core `AgentEvent` | High | High | `stream-subscriber.ts` adapter normalizes events; unit-tested |
+| Mastra `fullStream` event shape differs from pi-agent-core `AgentEvent` | High | High | `subscribeMastraSession()` + `MastraEventFeed` provide same output contract [Blocker 1] |
 | TypeBox → Zod conversion loses schema fidelity for complex tool schemas | Medium | Medium | Comprehensive unit tests; fallback to `z.unknown()` for unsupported types |
-| Anthropic OAuth tokens (`sk-ant-oat-*`) not supported via `OpenAICompatibleConfig` | Medium | High | Use `@ai-sdk/anthropic` directly for OAuth token auth; detect token type in `model-config.ts` |
+| Anthropic API not OpenAI-compatible — wire format, tool schema, headers differ | **High** | **High** | Use `@ai-sdk/anthropic` for `anthropic-messages`; detect OAuth tokens by `sk-ant-oat-*` prefix [Blocker 6] |
 | Google/Bedrock native auth not supported via `OpenAICompatibleConfig` | High | High | Use `@ai-sdk/google` / `@ai-sdk/amazon-bedrock` for these providers (already in plan) |
 | `thinkLevel` / extended thinking not exposed via `OpenAICompatibleConfig` | Medium | Medium | Use `providerOptions` in `AgentStreamOptions`; map per-provider in `toMastraStreamOptions` |
+| `lastAssistant` type mismatch — Mastra returns `CoreMessage[]` not `AssistantMessage` | High | High | `buildLastAssistantFromMastra()` constructs `AssistantMessage` from Mastra output [Blocker 2] |
+| Auth resolution broken — `Model<Api>` not passed to `runMastraAgent` | High | High | Resolve auth via `resolveModelAuthMode()` + `getApiKeyForModel()` before calling `runMastraAgent` [Blocker 3] |
+| Compaction incomplete — JSONL write-back missing | High | High | `mastraCompact()` acquires write lock and writes back to JSONL atomically [Blocker 4] |
+| `compaction.mode = "safeguard"` silently broken in Mastra path | High | Medium | Throw `ConfigurationError` for unsupported extension modes [Blocker 5] |
+| `maxSteps: 50` truncates long-running agents silently | High | High | Default `maxSteps: 200`; document behavioral difference in CHANGELOG [Blocker 7] |
 | Mastra v1.8.0 has breaking changes in a future patch | Low | Low | Pin exact version `1.8.0`; upgrade deliberately |
 | Session JSONL files become inconsistent if Mastra path crashes mid-write | Low | Medium | Wrap JSONL writes in the same atomic write pattern used by pi-coding-agent |
 
@@ -614,15 +747,21 @@ Everything else: all channel files, routing, CLI, gateway HTTP/WS server, sessio
 
 ```
 Phase 1 — Adapter Layer
-  1.  Add @mastra/core@1.8.0, @ai-sdk/google, @ai-sdk/amazon-bedrock, ai to package.json
+  1.  Add @mastra/core@1.8.0, @ai-sdk/anthropic, @ai-sdk/google, @ai-sdk/amazon-bedrock, ai to package.json [Blocker 6]
   2.  Create src/agents/mastra/types.ts
   3.  Create src/agents/mastra/typebox-to-zod.ts + unit tests
   4.  Create src/agents/mastra/message-adapter.ts + unit tests
   5.  Create src/agents/mastra/tool-adapter.ts + unit tests
-  6.  Create src/agents/mastra/model-config.ts + unit tests
-  7.  Create src/agents/mastra/stream-subscriber.ts + unit tests
+  6.  Create src/agents/mastra/model-config.ts + unit tests (including @ai-sdk/anthropic branch and OAuth token detection) [Blocker 6]
+  7.  Create src/agents/mastra/stream-subscriber.ts (internal fullStream → MastraSessionEvent translator)
+  7a. Create src/agents/mastra/mastra-event-feed.ts — MastraEventFeed and MastraSessionEvent types [Blocker 1]
+  7b. Create src/agents/mastra/subscribe-mastra-session.ts — full subscribeMastraSession() implementation [Blocker 1]
+  7c. Write unit tests for subscribeMastraSession() covering: text streaming, tool calls, compaction events, abort, messaging tool tracking [Blocker 1]
   8.  Create src/agents/mastra/session-manager-compat.ts
-  9.  Create src/agents/mastra/compaction.ts + unit tests
+  9.  Create src/agents/mastra/compaction.ts + unit tests [Blocker 4]
+  9a. Specify compaction prompt format and firstKeptMessageIndex resolution logic [Blocker 4]
+  9b. Specify JSONL write-back after mastraCompact() returns [Blocker 4]
+  9c. Verify session write lock is acquired/released in Mastra compaction branch [Blocker 4]
   10. Create src/agents/mastra/agent-runner.ts + integration tests (mocked provider)
   11. Create src/agents/mastra/index.ts
 
@@ -632,8 +771,10 @@ Phase 2 — Config Schema
   14. Add schema help text to src/config/schema.ts
 
 Phase 3 — Wire the Flag
-  15. Modify src/agents/pi-embedded-runner/run/attempt.ts — add Mastra branch
-  16. Modify src/agents/pi-embedded-runner/compact.ts — add Mastra compaction branch
+  15. Modify src/agents/pi-embedded-runner/run/attempt.ts — add Mastra branch with auth resolution and config validation [Blockers 2, 3, 5]
+  15a. Add buildLastAssistantFromMastra() to src/agents/pi-embedded-runner/run/types.ts [Blocker 2]
+  15b. Add config validation in attempt.ts Mastra branch: error on compaction.mode = "safeguard" and contextPruning.mode = "cache-ttl" [Blocker 5]
+  16. Modify src/agents/pi-embedded-runner/compact.ts — add Mastra compaction branch using mastraCompact() [Blocker 4]
 
 Phase 4 — Validate
   17. pnpm test — all existing tests pass (gateway = "pi" default)
@@ -642,7 +783,7 @@ Phase 4 — Validate
   20. pnpm check — lint/format clean
 
 Phase 5 — PR
-  21. Update CHANGELOG.md
+  21. Update CHANGELOG.md (document maxSteps behavioral difference vs pi path) [Blocker 7]
   22. Update PR description with test results
 ```
 
@@ -658,19 +799,22 @@ graph TD
     D --> E{agents.gateway config}
     E -->|pi - current default| F[pi-coding-agent createAgentSession]
     E -->|mastra - new| G[mastra/agent-runner.ts runMastraAgent]
-    F --> H[pi-ai streamSimple]
-    G --> I[Mastra Agent.stream]
-    H --> J[Provider API]
-    I --> K[MastraModelConfig]
-    K -->|OpenAI-compatible| L[OpenAICompatibleConfig → Provider API]
-    K -->|Google| M[@ai-sdk/google → Google API]
-    K -->|Bedrock| N[@ai-sdk/amazon-bedrock → AWS API]
-    G --> O[mastra/stream-subscriber.ts]
-    O --> P[AgentEvent stream - same as pi path]
-    P --> Q[subscribeEmbeddedPiSession - unchanged]
-    Q --> R[Channel delivery - unchanged]
-    D --> S[JSONL session file - unchanged format]
-    G --> S
+    F --> H[subscribeEmbeddedPiSession - uses AgentSession directly]
+    G --> I[Auth resolution via resolveModelAuthMode + getApiKeyForModel]
+    I --> J{modelApi}
+    J -->|anthropic-messages| K[@ai-sdk/anthropic LanguageModelV1 - Blocker 6]
+    J -->|openai-compatible| L[OpenAICompatibleConfig]
+    J -->|google-generative-ai| M[@ai-sdk/google LanguageModelV1]
+    J -->|bedrock-converse-stream| N[@ai-sdk/amazon-bedrock LanguageModelV1]
+    G --> O[mastra/subscribe-mastra-session.ts subscribeMastraSession - NEW - Blocker 1]
+    H --> P[assistantTexts + toolMetas + compaction]
+    O --> P
+    P --> Q[Channel delivery - unchanged]
+    D --> R[JSONL session file - SessionManager]
+    G --> S[JSONL session file - mastraCompact writes back - Blocker 4]
+    G --> T{compaction.mode}
+    T -->|safeguard| U[ConfigurationError - not supported in Mastra path - Blocker 5]
+    T -->|default| V[maxSteps ceiling 200 - document behavioral difference - Blocker 7]
 ```
 
 ---
@@ -679,18 +823,34 @@ graph TD
 
 These were potential open questions; all three are resolved by inspecting the Mastra v1.8.0 package source directly.
 
-### 15.1 Anthropic OAuth tokens (`sk-ant-oat-*`) — **Not a dependency, already works**
+### 15.1 Anthropic OAuth tokens (`sk-ant-oat-*`) — **`@ai-sdk/anthropic` required regardless of token type**
 
-Verified from `createOpenAICompatible` in Mastra's bundled source:
+**[Blocker 6 — CORRECTED]** The previous analysis was partially correct about the auth header but wrong about the wire format.
 
-```javascript
-const headers = {
-  ...options.apiKey && { Authorization: `Bearer ${options.apiKey}` },
-  ...options.headers
-};
+`OpenAICompatibleConfig` does send `Authorization: Bearer <apiKey>` which is correct for OAuth tokens. However, Anthropic's API uses a completely different wire format from OpenAI:
+
+| Aspect | OpenAI format | Anthropic format |
+|---|---|---|
+| Tool schema | `{ type: "function", function: { name, parameters } }` | `{ name, description, input_schema }` |
+| Tool call in response | `{ tool_calls: [{ function: { name, arguments: string } }] }` | `{ content: [{ type: "tool_use", name, input: object }] }` |
+| Tool result | `{ role: "tool", tool_call_id, content: string }` | `{ role: "user", content: [{ type: "tool_result", tool_use_id }] }` |
+| Required headers | `Authorization: Bearer` | `x-api-key` AND `anthropic-version: 2023-06-01` |
+| Streaming | `data: {"choices": [{"delta": {"content": "..."}}]}` | `data: {"type": "content_block_delta", ...}` |
+
+Sending OpenAI-format requests to `api.anthropic.com/v1/messages` returns HTTP 400 errors. **`@ai-sdk/anthropic` is required for `anthropic-messages`** regardless of whether the token is a standard API key or an OAuth token.
+
+For OAuth tokens (`sk-ant-oat-*`), `@ai-sdk/anthropic` v1.x supports Bearer auth via the `headers` option:
+
+```typescript
+const provider = createAnthropic({
+  headers: {
+    "Authorization": `Bearer ${oauthToken}`,
+    "anthropic-version": "2023-06-01",
+  },
+});
 ```
 
-`OpenAICompatibleConfig` sets `Authorization: Bearer <apiKey>`. Passing `sk-ant-oat-*` as `apiKey` sends the correct Bearer header that Anthropic's OAuth API expects. **No `@ai-sdk/anthropic` package is needed for OAuth tokens.** This is a non-issue — `OpenAICompatibleConfig` handles it natively.
+The `model-config.ts` detects OAuth tokens by the `sk-ant-oat-*` prefix and switches to Bearer auth automatically.
 
 ### 15.2 Partial tool result streaming — **Supported natively**
 
@@ -706,21 +866,26 @@ tool-result                      — final tool result (after execution)
 
 Tool call input streaming is supported. Tool results are emitted as final (not partial) — same behavior as pi-agent-core. This is a feature that works out of the box, not a dependency to add.
 
-### 15.3 `maxSteps` default — **A required configuration, not a dependency**
+### 15.3 `maxSteps` default — **A required configuration with behavioral difference from pi path**
 
-Verified from Mastra source: `maxSteps` defaults to `5`. The current pi-coding-agent loop runs until the model stops calling tools (no hard limit). **The adapter must set `maxSteps` explicitly** to avoid cutting off tool loops prematurely.
+**[Blocker 7 — CORRECTED]** Verified from Mastra source: `maxSteps` defaults to `5`. The current pi-coding-agent loop runs until the model stops calling tools (no hard limit). **The adapter must set `maxSteps` explicitly** to avoid cutting off tool loops prematurely.
 
-This is a **configuration value** to set in the adapter, not a new dependency:
+The default of `50` is **insufficient** for complex tasks. The pi path has no hard step limit — agents doing large codebase refactoring can exceed 100 tool calls. `maxSteps: 50` would silently truncate these agents with no error indication.
 
 ```typescript
 // In agent-runner.ts
 const output = await agent.stream(coreMessages, {
-  maxSteps: params.config?.agents?.defaults?.maxSteps ?? 50,
+  // 200 is a safety ceiling, not a target — most agents finish in <50 steps
+  // but complex refactoring tasks can exceed 100. The pi path has no equivalent limit.
+  maxSteps: params.config?.agents?.defaults?.maxSteps ?? 200,
   providerOptions: toMastraProviderOptions(params.thinkLevel, params.provider),
 });
 ```
 
-Recommended default: `50` (matches typical pi-coding-agent behavior for complex tasks). Configurable via `agents.defaults.maxSteps` in the OpenClaw config (field already exists).
+**Behavioral difference that must be documented in CHANGELOG:**
+> `gateway = "mastra"` with `maxSteps` set to any finite value will truncate agents that exceed that step count. The pi path has no equivalent limit. For agents that require unlimited tool call loops (e.g., large codebase refactoring), use `gateway = "pi"` until Mastra-native compaction is implemented (Phase 2).
+
+Configurable via `agents.defaults.maxSteps` in the OpenClaw config (field already exists).
 
 ---
 
